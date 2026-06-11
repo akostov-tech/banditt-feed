@@ -14,14 +14,13 @@ const imageCache = new NodeCache({ stdTTL: 86400 });
 async function fetchFeed() {
   const cached = feedCache.get('feed');
   if (cached) return cached;
-  console.log('[Feed] Fetching from Bandittwear...');
+  console.log('[Feed] Fetching...');
   const { data } = await axios.get(SOURCE_FEED, {
     timeout: 15000,
     headers: { 'User-Agent': 'Mozilla/5.0 (compatible; FeedBot/1.0)' }
   });
   const parsed = await parseStringPromise(data, { explicitArray: true });
   feedCache.set('feed', parsed);
-  console.log('[Feed] Cached for 1 hour.');
   return parsed;
 }
 
@@ -30,103 +29,151 @@ function formatPrice(p) {
   return match ? `${parseFloat(match[1]).toFixed(2)} lv.` : p;
 }
 
-function makePriceSvg(priceText, salePriceText, width) {
-  const isOnSale = salePriceText && salePriceText !== priceText;
-  const displayPrice = formatPrice(isOnSale ? salePriceText : priceText);
-  const oldPrice = isOnSale ? formatPrice(priceText) : null;
-
-  const badgeBg = isOnSale ? '#E74C3C' : '#1a1a1a';
-  const fontSize = Math.round(width * 0.07);
-  const smallFont = Math.round(width * 0.045);
-  const pad = Math.round(width * 0.03);
-  const bh = fontSize + pad * 2;
-  const charW = fontSize * 0.6;
-  const bw = Math.round(displayPrice.length * charW + pad * 3);
-  const bx = width - bw - pad;
-  const by = width - bh - pad;
-  const r = Math.round(width * 0.02);
-
-  let oldPriceSvg = '';
-  if (oldPrice) {
-    const ow = Math.round(oldPrice.length * smallFont * 0.6 + pad * 2);
-    const oh = smallFont + pad * 1.5;
-    const ox = bx - ow - Math.round(width * 0.015);
-    const oy = by + (bh - oh) / 2;
-    const or2 = Math.round(width * 0.013);
-    const textX = ox + ow / 2;
-    const textY = oy + oh / 2 + smallFont * 0.35;
-    const strikeY = oy + oh / 2;
-    const strikeX1 = ox + pad * 0.8;
-    const strikeX2 = ox + ow - pad * 0.8;
-    oldPriceSvg = `
-      <rect x="${ox}" y="${oy}" width="${ow}" height="${oh}" rx="${or2}" fill="rgba(0,0,0,0.6)"/>
-      <text x="${textX}" y="${textY}" font-family="Arial,sans-serif" font-size="${smallFont}" fill="#CCCCCC" text-anchor="middle">${oldPrice}</text>
-      <line x1="${strikeX1}" y1="${strikeY}" x2="${strikeX2}" y2="${strikeY}" stroke="#AAAAAA" stroke-width="2"/>
-    `;
-  }
-
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${width}">
-    ${oldPriceSvg}
-    <rect x="${bx}" y="${by}" width="${bw}" height="${bh}" rx="${r}" fill="${badgeBg}"/>
-    <text x="${bx + bw / 2}" y="${by + bh / 2 + fontSize * 0.35}" font-family="Arial,sans-serif" font-size="${fontSize}" font-weight="bold" fill="#FFFFFF" text-anchor="middle">${displayPrice}</text>
-  </svg>`;
+async function fetchImageBuffer(url) {
+  const res = await axios.get(url, {
+    responseType: 'arraybuffer',
+    timeout: 10000,
+    headers: { 'User-Agent': 'Mozilla/5.0' }
+  });
+  return Buffer.from(res.data);
 }
 
-async function addPriceOverlay(imageUrl, priceText, salePriceText) {
-  const cacheKey = `img_${imageUrl}_${priceText}_${salePriceText}`;
+async function buildAdImage(mainImageUrl, secondImageUrl, priceText, salePriceText) {
+  const cacheKey = `ad_${mainImageUrl}_${secondImageUrl}_${priceText}_${salePriceText}`;
   const cached = imageCache.get(cacheKey);
   if (cached) return cached;
 
   try {
-    const response = await axios.get(imageUrl, {
-      responseType: 'arraybuffer',
-      timeout: 10000,
-      headers: { 'User-Agent': 'Mozilla/5.0' }
-    });
+    const SIZE = 1080;          // финален квадрат 1080x1080
+    const LEFT_W = 600;         // лява зона (продуктова снимка)
+    const RIGHT_W = SIZE - LEFT_W; // дясна зона (480px)
+    const PAD = 24;
 
-    const imgBuffer = Buffer.from(response.data);
-    const meta = await sharp(imgBuffer).metadata();
-    const size = Math.min(Math.max(meta.width, meta.height), 1200);
-
-    // Resize to square with white background
-    const resized = await sharp(imgBuffer)
-      .resize(size, size, { fit: 'contain', background: { r: 255, g: 255, b: 255, alpha: 1 } })
-      .png()
+    // ── 1. Лява снимка ──────────────────────────────────────────────────────
+    const mainBuf = await fetchImageBuffer(mainImageUrl);
+    const leftImg = await sharp(mainBuf)
+      .resize(LEFT_W, SIZE, { fit: 'cover', position: 'centre' })
+      .jpeg({ quality: 92 })
       .toBuffer();
 
-    // Create SVG overlay with price
-    const svgOverlay = Buffer.from(makePriceSvg(priceText, salePriceText, size));
+    // ── 2. Дясна зона — бял фон ─────────────────────────────────────────────
+    // Втора снимка (горна половина на дясната зона)
+    const RIGHT_IMG_H = Math.round(SIZE * 0.52);
+    let rightImgResized;
+    if (secondImageUrl) {
+      try {
+        const secBuf = await fetchImageBuffer(secondImageUrl);
+        rightImgResized = await sharp(secBuf)
+          .resize(RIGHT_W - PAD * 2, RIGHT_IMG_H - PAD * 2, { fit: 'contain', background: { r: 255, g: 255, b: 255, alpha: 1 } })
+          .png()
+          .toBuffer();
+      } catch (_) { rightImgResized = null; }
+    }
 
-    const result = await sharp(resized)
-      .composite([{ input: svgOverlay, top: 0, left: 0 }])
-      .jpeg({ quality: 90 })
+    // ── 3. SVG за дясната зона ──────────────────────────────────────────────
+    const isOnSale = salePriceText && salePriceText !== priceText;
+    const displayPrice = formatPrice(isOnSale ? salePriceText : priceText);
+    const oldPrice = isOnSale ? formatPrice(priceText) : null;
+
+    const priceFontSize = 52;
+    const oldPriceFontSize = 32;
+    const btnH = 72;
+    const btnY = SIZE - PAD * 3 - btnH;
+    const btnX = PAD;
+    const btnW = RIGHT_W - PAD * 2;
+    const btnR = 8;
+
+    // Цена позиция — под снимката
+    const priceY = RIGHT_IMG_H + PAD + priceFontSize + 10;
+    const oldPriceY = priceY + oldPriceFontSize + 8;
+
+    let oldPriceSvg = '';
+    if (oldPrice) {
+      oldPriceSvg = `
+        <text x="${PAD}" y="${oldPriceY}" font-family="Arial,sans-serif" font-size="${oldPriceFontSize}" fill="#AAAAAA">${oldPrice}</text>
+        <line x1="${PAD}" y1="${oldPriceY - oldPriceFontSize * 0.4}" x2="${PAD + oldPrice.length * oldPriceFontSize * 0.55}" y2="${oldPriceY - oldPriceFontSize * 0.4}" stroke="#AAAAAA" stroke-width="2"/>
+      `;
+    }
+
+    // Разделителна линия между ляво и дясно
+    const dividerSvg = `
+      <svg xmlns="http://www.w3.org/2000/svg" width="${SIZE}" height="${SIZE}">
+        <line x1="${LEFT_W}" y1="40" x2="${LEFT_W}" y2="${SIZE - 40}" stroke="#E0E0E0" stroke-width="1"/>
+      </svg>
+    `;
+
+    // SVG за дясна зона (само текст и бутон — снимката се composite-ва отделно)
+    const rightSvg = `
+      <svg xmlns="http://www.w3.org/2000/svg" width="${RIGHT_W}" height="${SIZE}">
+        <rect width="${RIGHT_W}" height="${SIZE}" fill="#FFFFFF"/>
+
+        <!-- Цена -->
+        <text x="${PAD}" y="${priceY}" font-family="Arial,sans-serif" font-size="${priceFontSize}" font-weight="bold" fill="#1a1a1a">${displayPrice}</text>
+        ${oldPriceSvg}
+
+        <!-- Бутон "Купи сега" -->
+        <rect x="${btnX}" y="${btnY}" width="${btnW}" height="${btnH}" rx="${btnR}" fill="#1a1a1a"/>
+        <text x="${btnX + btnW / 2}" y="${btnY + btnH / 2 + 10}" font-family="Arial,sans-serif" font-size="26" font-weight="bold" fill="#FFFFFF" text-anchor="middle">Купи сега</text>
+      </svg>
+    `;
+
+    // ── 4. Сглобяване ───────────────────────────────────────────────────────
+    // Бял canvas 1080x1080
+    const base = await sharp({
+      create: { width: SIZE, height: SIZE, channels: 3, background: { r: 255, g: 255, b: 255 } }
+    }).png().toBuffer();
+
+    const composites = [
+      // Лява снимка
+      { input: leftImg, left: 0, top: 0 },
+      // Дясна SVG зона
+      { input: Buffer.from(rightSvg), left: LEFT_W, top: 0 },
+      // Разделителна линия
+      { input: Buffer.from(dividerSvg), left: 0, top: 0 },
+    ];
+
+    // Втора снимка в дясната зона (горе)
+    if (rightImgResized) {
+      composites.push({
+        input: rightImgResized,
+        left: LEFT_W + PAD,
+        top: PAD
+      });
+    }
+
+    const result = await sharp(base)
+      .composite(composites)
+      .jpeg({ quality: 92 })
       .toBuffer();
 
     imageCache.set(cacheKey, result);
     return result;
+
   } catch (err) {
-    console.error(`[Image] Error for ${imageUrl}:`, err.message);
+    console.error(`[Image] Error:`, err.message);
     return null;
   }
 }
 
+// ── Endpoint: снимка ─────────────────────────────────────────────────────────
 app.get('/image', async (req, res) => {
-  const { url, price, sale_price } = req.query;
+  const { url, url2, price, sale_price } = req.query;
   if (!url || !price) return res.status(400).send('Missing url or price');
 
-  const buffer = await addPriceOverlay(
+  const buffer = await buildAdImage(
     decodeURIComponent(url),
+    url2 ? decodeURIComponent(url2) : null,
     decodeURIComponent(price),
     sale_price ? decodeURIComponent(sale_price) : null
   );
 
   if (!buffer) return res.status(502).send('Could not process image');
-
   res.set('Content-Type', 'image/jpeg');
   res.set('Cache-Control', 'public, max-age=86400');
   res.send(buffer);
 });
 
+// ── Endpoint: XML фийд ───────────────────────────────────────────────────────
 app.get('/feed.xml', async (req, res) => {
   try {
     const feed = await fetchFeed();
@@ -138,11 +185,16 @@ app.get('/feed.xml', async (req, res) => {
       const price = item['g:price']?.[0];
       const salePrice = item['g:sale_price']?.[0];
 
+      // Взимаме втората снимка ако съществува
+      const additionalImages = item['g:additional_image_link'] || [];
+      const secondImage = additionalImages.find(u => u && u.startsWith('http'));
+
       if (imageUrl && price) {
         const encodedUrl = encodeURIComponent(imageUrl);
         const encodedPrice = encodeURIComponent(price);
         const encodedSale = salePrice ? `&sale_price=${encodeURIComponent(salePrice)}` : '';
-        item['g:image_link'] = [`${baseUrl}/image?url=${encodedUrl}&price=${encodedPrice}${encodedSale}`];
+        const encodedUrl2 = secondImage ? `&url2=${encodeURIComponent(secondImage)}` : '';
+        item['g:image_link'] = [`${baseUrl}/image?url=${encodedUrl}&price=${encodedPrice}${encodedSale}${encodedUrl2}`];
       }
       return item;
     });
@@ -162,7 +214,7 @@ app.get('/feed.xml', async (req, res) => {
         channel: [{
           title: feed.rss.channel[0].title,
           link: feed.rss.channel[0].link,
-          description: ['Bandittwear enriched feed with price overlay'],
+          description: ['Bandittwear enriched feed'],
           item: newItems
         }]
       }
@@ -178,10 +230,6 @@ app.get('/feed.xml', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', feed: '/feed.xml' });
-});
+app.get('/', (req, res) => res.json({ status: 'ok', feed: '/feed.xml' }));
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
