@@ -38,8 +38,35 @@ async function fetchImageBuffer(url) {
   return Buffer.from(res.data);
 }
 
-async function buildAdImage(mainImageUrl, secondImageUrl, priceText, salePriceText) {
-  const cacheKey = `ad_${mainImageUrl}_${secondImageUrl}_${priceText}_${salePriceText}`;
+function escapeXml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function wrapTextLines(text, maxCharsPerLine, maxLines) {
+  const words = text.split(' ');
+  const lines = [];
+  let line = '';
+  for (const w of words) {
+    const test = (line + ' ' + w).trim();
+    if (test.length > maxCharsPerLine && line) {
+      lines.push(line);
+      line = w;
+    } else {
+      line = test;
+    }
+    if (lines.length >= maxLines) break;
+  }
+  if (line && lines.length < maxLines) lines.push(line);
+  return lines.slice(0, maxLines);
+}
+
+async function buildAdImage(mainImageUrl, secondImageUrl, priceText, salePriceText, productTitle) {
+  const cacheKey = `ad_${mainImageUrl}_${secondImageUrl}_${priceText}_${salePriceText}_${productTitle}`;
   const cached = imageCache.get(cacheKey);
   if (cached) return cached;
 
@@ -58,7 +85,7 @@ async function buildAdImage(mainImageUrl, secondImageUrl, priceText, salePriceTe
 
     // ── 2. Дясна зона — бял фон ─────────────────────────────────────────────
     // Втора снимка (горна половина на дясната зона)
-    const RIGHT_IMG_H = Math.round(SIZE * 0.52);
+    const RIGHT_IMG_H = Math.round(SIZE * 0.46);
     let rightImgResized;
     if (secondImageUrl) {
       try {
@@ -75,16 +102,25 @@ async function buildAdImage(mainImageUrl, secondImageUrl, priceText, salePriceTe
     const displayPrice = formatPrice(isOnSale ? salePriceText : priceText);
     const oldPrice = isOnSale ? formatPrice(priceText) : null;
 
-    const priceFontSize = 52;
-    const oldPriceFontSize = 32;
+    const titleFontSize = 30;
+    const priceFontSize = 48;
+    const oldPriceFontSize = 30;
     const btnH = 72;
     const btnY = SIZE - PAD * 3 - btnH;
     const btnX = PAD;
     const btnW = RIGHT_W - PAD * 2;
     const btnR = 8;
 
-    // Цена позиция — под снимката
-    const priceY = RIGHT_IMG_H + PAD + priceFontSize + 10;
+    // Заглавие — под втора снимка
+    const titleStartY = RIGHT_IMG_H + PAD + titleFontSize;
+    const titleLines = productTitle ? wrapTextLines(productTitle, 26, 2) : [];
+    const titleSvgLines = titleLines.map((line, i) =>
+      `<text x="${PAD}" y="${titleStartY + i * (titleFontSize + 6)}" font-family="Arial,sans-serif" font-size="${titleFontSize}" font-weight="600" fill="#222222">${escapeXml(line)}</text>`
+    ).join('');
+    const titleBlockH = titleLines.length * (titleFontSize + 6);
+
+    // Цена позиция — под заглавието
+    const priceY = titleStartY + titleBlockH + priceFontSize - 4;
     const oldPriceY = priceY + oldPriceFontSize + 8;
 
     let oldPriceSvg = '';
@@ -102,10 +138,13 @@ async function buildAdImage(mainImageUrl, secondImageUrl, priceText, salePriceTe
       </svg>
     `;
 
-    // SVG за дясна зона (само текст и бутон — снимката се composite-ва отделно)
+    // SVG за дясна зона (текст, заглавие и бутон — снимката се composite-ва отделно)
     const rightSvg = `
       <svg xmlns="http://www.w3.org/2000/svg" width="${RIGHT_W}" height="${SIZE}">
         <rect width="${RIGHT_W}" height="${SIZE}" fill="#FFFFFF"/>
+
+        <!-- Заглавие на продукта -->
+        ${titleSvgLines}
 
         <!-- Цена -->
         <text x="${PAD}" y="${priceY}" font-family="Arial,sans-serif" font-size="${priceFontSize}" font-weight="bold" fill="#1a1a1a">${displayPrice}</text>
@@ -157,14 +196,15 @@ async function buildAdImage(mainImageUrl, secondImageUrl, priceText, salePriceTe
 
 // ── Endpoint: снимка ─────────────────────────────────────────────────────────
 app.get('/image', async (req, res) => {
-  const { url, url2, price, sale_price } = req.query;
+  const { url, url2, price, sale_price, title } = req.query;
   if (!url || !price) return res.status(400).send('Missing url or price');
 
   const buffer = await buildAdImage(
     decodeURIComponent(url),
     url2 ? decodeURIComponent(url2) : null,
     decodeURIComponent(price),
-    sale_price ? decodeURIComponent(sale_price) : null
+    sale_price ? decodeURIComponent(sale_price) : null,
+    title ? decodeURIComponent(title) : null
   );
 
   if (!buffer) return res.status(502).send('Could not process image');
@@ -184,6 +224,7 @@ app.get('/feed.xml', async (req, res) => {
       const imageUrl = item['g:image_link']?.[0];
       const price = item['g:price']?.[0];
       const salePrice = item['g:sale_price']?.[0];
+      const title = item['title']?.[0] || item['g:title']?.[0];
 
       // Взимаме втората снимка ако съществува
       const additionalImages = item['g:additional_image_link'] || [];
@@ -194,7 +235,8 @@ app.get('/feed.xml', async (req, res) => {
         const encodedPrice = encodeURIComponent(price);
         const encodedSale = salePrice ? `&sale_price=${encodeURIComponent(salePrice)}` : '';
         const encodedUrl2 = secondImage ? `&url2=${encodeURIComponent(secondImage)}` : '';
-        item['g:image_link'] = [`${baseUrl}/image?url=${encodedUrl}&price=${encodedPrice}${encodedSale}${encodedUrl2}`];
+        const encodedTitle = title ? `&title=${encodeURIComponent(title)}` : '';
+        item['g:image_link'] = [`${baseUrl}/image?url=${encodedUrl}&price=${encodedPrice}${encodedSale}${encodedUrl2}${encodedTitle}`];
       }
       return item;
     });
