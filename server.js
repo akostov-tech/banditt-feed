@@ -7,9 +7,12 @@ const NodeCache = require('node-cache');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SOURCE_FEED = 'https://bandittwear.bg/wp-content/uploads/woo-feed/facebook/xml/facebook_catalog_export.xml';
+const LOGO_URL = 'https://raw.githubusercontent.com/akostov-tech/banditt-feed/main/logo.png';
+const BRAND_NAME = 'BANDITT WEAR';
 
 const feedCache = new NodeCache({ stdTTL: 3600 });
 const imageCache = new NodeCache({ stdTTL: 86400 });
+let logoCache = null;
 
 async function fetchFeed() {
   const cached = feedCache.get('feed');
@@ -24,11 +27,6 @@ async function fetchFeed() {
   return parsed;
 }
 
-function formatPrice(p) {
-  const match = p.match(/([\d.]+)/);
-  return match ? `${parseFloat(match[1]).toFixed(2)} lv.` : p;
-}
-
 async function fetchImageBuffer(url) {
   const res = await axios.get(url, {
     responseType: 'arraybuffer',
@@ -36,6 +34,36 @@ async function fetchImageBuffer(url) {
     headers: { 'User-Agent': 'Mozilla/5.0' }
   });
   return Buffer.from(res.data);
+}
+
+async function getLogoCircleBuffer(diameter) {
+  const cacheKey = `logo_${diameter}`;
+  const cached = imageCache.get(cacheKey);
+  if (cached) return cached;
+
+  try {
+    if (!logoCache) {
+      logoCache = await fetchImageBuffer(LOGO_URL);
+    }
+    // Crop logo into a circle
+    const circleMask = Buffer.from(
+      `<svg width="${diameter}" height="${diameter}"><circle cx="${diameter / 2}" cy="${diameter / 2}" r="${diameter / 2}" fill="#fff"/></svg>`
+    );
+    const resizedLogo = await sharp(logoCache)
+      .resize(diameter, diameter, { fit: 'cover', position: 'centre' })
+      .toBuffer();
+
+    const circular = await sharp(resizedLogo)
+      .composite([{ input: circleMask, blend: 'dest-in' }])
+      .png()
+      .toBuffer();
+
+    imageCache.set(cacheKey, circular);
+    return circular;
+  } catch (err) {
+    console.error('[Logo] Error:', err.message);
+    return null;
+  }
 }
 
 function escapeXml(s) {
@@ -65,119 +93,93 @@ function wrapTextLines(text, maxCharsPerLine, maxLines) {
   return lines.slice(0, maxLines);
 }
 
-async function buildAdImage(mainImageUrl, secondImageUrl, priceText, salePriceText, productTitle) {
-  const cacheKey = `ad_${mainImageUrl}_${secondImageUrl}_${priceText}_${salePriceText}_${productTitle}`;
+// ── Marpipe-style banner: лого+бранд горе, echo-ефект, заглавие, SHOP NOW бар ──
+async function buildAdImage(mainImageUrl, productTitle) {
+  const cacheKey = `ad_${mainImageUrl}_${productTitle}`;
   const cached = imageCache.get(cacheKey);
   if (cached) return cached;
 
   try {
-    const SIZE = 1080;          // финален квадрат 1080x1080
-    const LEFT_W = 600;         // лява зона (продуктова снимка)
-    const RIGHT_W = SIZE - LEFT_W; // дясна зона (480px)
-    const PAD = 24;
+    const SIZE = 1080;
+    const HEADER_H = 130;          // лого + бранд зона
+    const FOOTER_H = 150;          // заглавие + SHOP NOW бар зона
+    const SHOP_BAR_H = 90;
+    const PHOTO_H = SIZE - HEADER_H - FOOTER_H;
+    const SIDE_ECHO_W = 90;        // ширина на страничните echo ленти
 
-    // ── 1. Лява снимка ──────────────────────────────────────────────────────
+    // ── 1. Основна снимка (централна, по-висока резолюция) ──────────────────
     const mainBuf = await fetchImageBuffer(mainImageUrl);
-    const leftImg = await sharp(mainBuf)
-      .resize(LEFT_W, SIZE, { fit: 'cover', position: 'centre' })
+    const centerImg = await sharp(mainBuf)
+      .resize(SIZE - SIDE_ECHO_W * 2, PHOTO_H, { fit: 'cover', position: 'centre' })
       .jpeg({ quality: 92 })
       .toBuffer();
 
-    // ── 2. Дясна зона — бял фон ─────────────────────────────────────────────
-    // Втора снимка (горна половина на дясната зона)
-    const RIGHT_IMG_H = Math.round(SIZE * 0.46);
-    let rightImgResized;
-    if (secondImageUrl) {
-      try {
-        const secBuf = await fetchImageBuffer(secondImageUrl);
-        rightImgResized = await sharp(secBuf)
-          .resize(RIGHT_W - PAD * 2, RIGHT_IMG_H - PAD * 2, { fit: 'contain', background: { r: 255, g: 255, b: 255, alpha: 1 } })
-          .png()
-          .toBuffer();
-      } catch (_) { rightImgResized = null; }
-    }
+    // ── 2. Echo ленти (странични, замъглени/затъмнени копия) ────────────────
+    const echoLeft = await sharp(mainBuf)
+      .resize(SIDE_ECHO_W * 3, PHOTO_H, { fit: 'cover', position: 'left' })
+      .extract({ left: 0, top: 0, width: SIDE_ECHO_W, height: PHOTO_H })
+      .modulate({ brightness: 0.75 })
+      .blur(1.5)
+      .jpeg({ quality: 85 })
+      .toBuffer();
 
-    // ── 3. SVG за дясната зона ──────────────────────────────────────────────
-    const isOnSale = salePriceText && salePriceText !== priceText;
-    const displayPrice = formatPrice(isOnSale ? salePriceText : priceText);
-    const oldPrice = isOnSale ? formatPrice(priceText) : null;
+    const echoRight = await sharp(mainBuf)
+      .resize(SIDE_ECHO_W * 3, PHOTO_H, { fit: 'cover', position: 'right' })
+      .extract({ left: SIDE_ECHO_W * 2, top: 0, width: SIDE_ECHO_W, height: PHOTO_H })
+      .modulate({ brightness: 0.75 })
+      .blur(1.5)
+      .jpeg({ quality: 85 })
+      .toBuffer();
 
-    const titleFontSize = 30;
-    const priceFontSize = 48;
-    const oldPriceFontSize = 30;
-    const btnH = 72;
-    const btnY = SIZE - PAD * 3 - btnH;
-    const btnX = PAD;
-    const btnW = RIGHT_W - PAD * 2;
-    const btnR = 8;
+    // ── 3. Лого кръг ──────────────────────────────────────────────────────
+    const logoDiameter = 76;
+    const logoCircle = await getLogoCircleBuffer(logoDiameter);
 
-    // Заглавие — под втора снимка
-    const titleStartY = RIGHT_IMG_H + PAD + titleFontSize;
-    const titleLines = productTitle ? wrapTextLines(productTitle, 26, 2) : [];
-    const titleSvgLines = titleLines.map((line, i) =>
-      `<text x="${PAD}" y="${titleStartY + i * (titleFontSize + 6)}" font-family="Arial,sans-serif" font-size="${titleFontSize}" font-weight="600" fill="#222222">${escapeXml(line)}</text>`
-    ).join('');
-    const titleBlockH = titleLines.length * (titleFontSize + 6);
+    // ── 4. Заглавие на продукта ──────────────────────────────────────────
+    const titleLines = productTitle ? wrapTextLines(productTitle, 38, 2) : [];
+    const titleFontSize = 26;
 
-    // Цена позиция — под заглавието
-    const priceY = titleStartY + titleBlockH + priceFontSize - 4;
-    const oldPriceY = priceY + oldPriceFontSize + 8;
-
-    let oldPriceSvg = '';
-    if (oldPrice) {
-      oldPriceSvg = `
-        <text x="${PAD}" y="${oldPriceY}" font-family="Arial,sans-serif" font-size="${oldPriceFontSize}" fill="#AAAAAA">${oldPrice}</text>
-        <line x1="${PAD}" y1="${oldPriceY - oldPriceFontSize * 0.4}" x2="${PAD + oldPrice.length * oldPriceFontSize * 0.55}" y2="${oldPriceY - oldPriceFontSize * 0.4}" stroke="#AAAAAA" stroke-width="2"/>
-      `;
-    }
-
-    // Разделителна линия между ляво и дясно
-    const dividerSvg = `
+    // ── 5. SVG слоеве: header bg, текст бранд, заглавие, shop now бар ───────
+    const headerSvg = `
       <svg xmlns="http://www.w3.org/2000/svg" width="${SIZE}" height="${SIZE}">
-        <line x1="${LEFT_W}" y1="40" x2="${LEFT_W}" y2="${SIZE - 40}" stroke="#E0E0E0" stroke-width="1"/>
+        <rect x="0" y="0" width="${SIZE}" height="${HEADER_H}" fill="#FFFFFF"/>
+        <text x="${28 + logoDiameter + 22}" y="${HEADER_H / 2 + 10}" font-family="Arial,sans-serif" font-size="32" font-weight="800" letter-spacing="1" fill="#1a1a1a">${escapeXml(BRAND_NAME)}</text>
+        <line x1="0" y1="${HEADER_H}" x2="${SIZE}" y2="${HEADER_H}" stroke="#EAEAEA" stroke-width="2"/>
       </svg>
     `;
 
-    // SVG за дясна зона (текст, заглавие и бутон — снимката се composite-ва отделно)
-    const rightSvg = `
-      <svg xmlns="http://www.w3.org/2000/svg" width="${RIGHT_W}" height="${SIZE}">
-        <rect width="${RIGHT_W}" height="${SIZE}" fill="#FFFFFF"/>
+    const footerStartY = HEADER_H + PHOTO_H;
+    const titleY1 = footerStartY + 38;
+    const titleSvgLines = titleLines.map((line, i) =>
+      `<text x="${SIZE / 2}" y="${titleY1 + i * (titleFontSize + 8)}" font-family="Arial,sans-serif" font-size="${titleFontSize}" fill="#333333" text-anchor="middle">${escapeXml(line)}</text>`
+    ).join('');
 
-        <!-- Заглавие на продукта -->
+    const shopBarY = SIZE - SHOP_BAR_H;
+    const footerSvg = `
+      <svg xmlns="http://www.w3.org/2000/svg" width="${SIZE}" height="${SIZE}">
+        <rect x="0" y="${footerStartY}" width="${SIZE}" height="${FOOTER_H - SHOP_BAR_H}" fill="#FFFFFF"/>
         ${titleSvgLines}
-
-        <!-- Цена -->
-        <text x="${PAD}" y="${priceY}" font-family="Arial,sans-serif" font-size="${priceFontSize}" font-weight="bold" fill="#1a1a1a">${displayPrice}</text>
-        ${oldPriceSvg}
-
-        <!-- Бутон "Купи сега" -->
-        <rect x="${btnX}" y="${btnY}" width="${btnW}" height="${btnH}" rx="${btnR}" fill="#1a1a1a"/>
-        <text x="${btnX + btnW / 2}" y="${btnY + btnH / 2 + 10}" font-family="Arial,sans-serif" font-size="26" font-weight="bold" fill="#FFFFFF" text-anchor="middle">Купи сега</text>
+        <rect x="0" y="${shopBarY}" width="${SIZE}" height="${SHOP_BAR_H}" fill="#1a1a1a"/>
+        <text x="40" y="${shopBarY + SHOP_BAR_H / 2 + 9}" font-family="Arial,sans-serif" font-size="26" font-weight="700" letter-spacing="2" fill="#FFFFFF">SHOP NOW</text>
+        <text x="${SIZE - 40}" y="${shopBarY + SHOP_BAR_H / 2 + 9}" font-family="Arial,sans-serif" font-size="26" font-weight="700" fill="#FFFFFF" text-anchor="end">&#9658;</text>
       </svg>
     `;
 
-    // ── 4. Сглобяване ───────────────────────────────────────────────────────
-    // Бял canvas 1080x1080
+    // ── 6. Сглобяване ─────────────────────────────────────────────────────
     const base = await sharp({
       create: { width: SIZE, height: SIZE, channels: 3, background: { r: 255, g: 255, b: 255 } }
     }).png().toBuffer();
 
     const composites = [
-      // Лява снимка
-      { input: leftImg, left: 0, top: 0 },
-      // Дясна SVG зона
-      { input: Buffer.from(rightSvg), left: LEFT_W, top: 0 },
-      // Разделителна линия
-      { input: Buffer.from(dividerSvg), left: 0, top: 0 },
+      { input: echoLeft, left: 0, top: HEADER_H },
+      { input: centerImg, left: SIDE_ECHO_W, top: HEADER_H },
+      { input: echoRight, left: SIZE - SIDE_ECHO_W, top: HEADER_H },
+      { input: Buffer.from(headerSvg), left: 0, top: 0 },
+      { input: Buffer.from(footerSvg), left: 0, top: 0 },
     ];
 
-    // Втора снимка в дясната зона (горе)
-    if (rightImgResized) {
-      composites.push({
-        input: rightImgResized,
-        left: LEFT_W + PAD,
-        top: PAD
-      });
+    if (logoCircle) {
+      composites.push({ input: logoCircle, left: 28, top: (HEADER_H - logoDiameter) / 2 });
     }
 
     const result = await sharp(base)
@@ -196,14 +198,11 @@ async function buildAdImage(mainImageUrl, secondImageUrl, priceText, salePriceTe
 
 // ── Endpoint: снимка ─────────────────────────────────────────────────────────
 app.get('/image', async (req, res) => {
-  const { url, url2, price, sale_price, title } = req.query;
-  if (!url || !price) return res.status(400).send('Missing url or price');
+  const { url, title } = req.query;
+  if (!url) return res.status(400).send('Missing url');
 
   const buffer = await buildAdImage(
     decodeURIComponent(url),
-    url2 ? decodeURIComponent(url2) : null,
-    decodeURIComponent(price),
-    sale_price ? decodeURIComponent(sale_price) : null,
     title ? decodeURIComponent(title) : null
   );
 
@@ -222,21 +221,12 @@ app.get('/feed.xml', async (req, res) => {
 
     const newItems = items.map(item => {
       const imageUrl = item['g:image_link']?.[0];
-      const price = item['g:price']?.[0];
-      const salePrice = item['g:sale_price']?.[0];
       const title = item['title']?.[0] || item['g:title']?.[0];
 
-      // Взимаме втората снимка ако съществува
-      const additionalImages = item['g:additional_image_link'] || [];
-      const secondImage = additionalImages.find(u => u && u.startsWith('http'));
-
-      if (imageUrl && price) {
+      if (imageUrl) {
         const encodedUrl = encodeURIComponent(imageUrl);
-        const encodedPrice = encodeURIComponent(price);
-        const encodedSale = salePrice ? `&sale_price=${encodeURIComponent(salePrice)}` : '';
-        const encodedUrl2 = secondImage ? `&url2=${encodeURIComponent(secondImage)}` : '';
         const encodedTitle = title ? `&title=${encodeURIComponent(title)}` : '';
-        item['g:image_link'] = [`${baseUrl}/image?url=${encodedUrl}&price=${encodedPrice}${encodedSale}${encodedUrl2}${encodedTitle}`];
+        item['g:image_link'] = [`${baseUrl}/image?url=${encodedUrl}${encodedTitle}`];
       }
       return item;
     });
