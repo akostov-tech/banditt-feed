@@ -2,7 +2,7 @@ services:
   - type: web
     name: banditt-feed-proxy
     env: node
-    buildCommand: npm install
+    buildCommand: npm install && curl -sL "https://raw.githubusercontent.com/google/fonts/main/ofl/metalmania/MetalMania-Regular.ttf" -o /usr/local/share/fonts/MetalMania-Regular.ttf && fc-cache -f
     startCommand: node server.js
     plan: free
     envVars:
